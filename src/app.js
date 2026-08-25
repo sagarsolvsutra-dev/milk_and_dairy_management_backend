@@ -10,17 +10,21 @@ const { notFound, errorHandler } = require("./middleware/error.middleware");
 
 const app = express();
 
+// Strip a trailing slash from each configured origin — a browser's Origin
+// header never has one, so "https://x.vercel.app/" in CLIENT_URL would
+// otherwise silently never match "https://x.vercel.app" and get rejected.
+const stripTrailingSlash = (url) => url.replace(/\/+$/, "");
 const allowedOrigins = (process.env.CLIENT_URL || "")
   .split(",")
-  .map((o) => o.trim())
+  .map((o) => stripTrailingSlash(o.trim()))
   .filter(Boolean);
 
 app.use(helmet());
 app.use(
   cors({
     origin(origin, callback) {
-      if (!origin || allowedOrigins.includes(origin)) return callback(null, true);
-      callback(new Error("Not allowed by CORS"));
+      if (!origin || allowedOrigins.includes(stripTrailingSlash(origin))) return callback(null, true);
+      callback(new Error(`Not allowed by CORS: ${origin}`));
     },
     credentials: true,
   })
