@@ -13,14 +13,19 @@ const notificationSchema = new mongoose.Schema(
     dairy: { type: mongoose.Schema.Types.ObjectId, ref: "Dairy", default: null },
     refModel: { type: String, default: null },
     refId: { type: mongoose.Schema.Types.ObjectId, default: null },
-    isRead: { type: Boolean, default: false },
+    // Per-recipient read state — a shared-audience notification (super_admin,
+    // or "all") is visible to every matching user/dairy at once, so a single
+    // isRead boolean would let one person's "read" hide it as read for
+    // everyone else too. Each id here (a User._id or a Dairy._id, per
+    // req.user._id's normalized shape) marks that one recipient has seen it.
+    readBy: { type: [mongoose.Schema.Types.ObjectId], default: [] },
   },
   { timestamps: true }
 );
 
 // getNotifications/markAllAsRead filter by audience+dairy and sort by
-// recency; unread counts filter the same way plus isRead.
+// recency; unread counts filter the same way plus readBy.
 notificationSchema.index({ audience: 1, dairy: 1, createdAt: -1 });
-notificationSchema.index({ audience: 1, isRead: 1 });
+notificationSchema.index({ audience: 1, readBy: 1 });
 
 module.exports = mongoose.model("Notification", notificationSchema);

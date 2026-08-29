@@ -4,6 +4,21 @@ const DairyItemStock = require("../models/DairyItemStock.model");
 const StockLedger = require("../models/StockLedger.model");
 const ApiError = require("../utils/ApiError");
 
+// Two concurrent upserts for the very first movement against a brand-new
+// stock key (nothing pre-seeds these documents) can both attempt to insert —
+// only one MongoDB upsert wins, the other throws a raw E11000 duplicate-key
+// error. Retrying the same findOneAndUpdate once is enough: the document
+// exists by the time the retry runs, so it becomes a normal (non-upsert)
+// atomic $inc against it instead of a second competing insert.
+const withUpsertRetry = async (fn) => {
+  try {
+    return await fn();
+  } catch (err) {
+    if (err?.code === 11000) return fn();
+    throw err;
+  }
+};
+
 // All three movers use a single atomic findOneAndUpdate ($inc + a conditional
 // filter) instead of read -> compute in JS -> save. Two concurrent requests
 // against the same stock doc can no longer both read the same starting value
@@ -16,10 +31,8 @@ const moveMilkStock = async ({ quantity, transactionType, refModel, refId, remar
   const filter = { key: "central" };
   if (quantity < 0) filter.currentQty = { $gte: -quantity };
 
-  const stock = await MilkStock.findOneAndUpdate(
-    filter,
-    { $inc: { currentQty: quantity } },
-    { new: true, upsert: quantity >= 0 }
+  const stock = await withUpsertRetry(() =>
+    MilkStock.findOneAndUpdate(filter, { $inc: { currentQty: quantity } }, { new: true, upsert: quantity >= 0 })
   );
   if (!stock) throw new ApiError(400, "Insufficient milk stock for this operation");
 
@@ -41,10 +54,8 @@ const moveCentralItemStock = async ({ item, quantity, transactionType, refModel,
   const filter = { item };
   if (quantity < 0) filter.currentQty = { $gte: -quantity };
 
-  const stock = await CentralItemStock.findOneAndUpdate(
-    filter,
-    { $inc: { currentQty: quantity } },
-    { new: true, upsert: quantity >= 0 }
+  const stock = await withUpsertRetry(() =>
+    CentralItemStock.findOneAndUpdate(filter, { $inc: { currentQty: quantity } }, { new: true, upsert: quantity >= 0 })
   );
   if (!stock) throw new ApiError(400, "Insufficient central item stock for this operation");
 
@@ -67,10 +78,8 @@ const moveDairyItemStock = async ({ dairy, item, quantity, transactionType, refM
   const filter = { dairy, item };
   if (quantity < 0) filter.currentQty = { $gte: -quantity };
 
-  const stock = await DairyItemStock.findOneAndUpdate(
-    filter,
-    { $inc: { currentQty: quantity } },
-    { new: true, upsert: quantity >= 0 }
+  const stock = await withUpsertRetry(() =>
+    DairyItemStock.findOneAndUpdate(filter, { $inc: { currentQty: quantity } }, { new: true, upsert: quantity >= 0 })
   );
   if (!stock) throw new ApiError(400, "Insufficient dairy item stock for this operation");
 

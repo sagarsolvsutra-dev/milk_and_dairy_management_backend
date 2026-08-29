@@ -2,6 +2,7 @@ const Dairy = require("../models/Dairy.model");
 const DairyItemStock = require("../models/DairyItemStock.model");
 const DispatchEntry = require("../models/DispatchEntry.model");
 const Bill = require("../models/Bill.model");
+const StockAdjustment = require("../models/StockAdjustment.model");
 const asyncHandler = require("../utils/asyncHandler");
 const ApiResponse = require("../utils/ApiResponse");
 const ApiError = require("../utils/ApiError");
@@ -29,7 +30,21 @@ exports.updateDairy = asyncHandler(async (req, res) => {
   res.status(200).json(new ApiResponse(200, dairy, "Dairy updated successfully"));
 });
 
-exports.deleteDairy = factory.deleteOne(Dairy, "Dairy");
+exports.deleteDairy = factory.deleteOne(Dairy, "Dairy", {
+  checkDependents: async (id) => {
+    // A dairy can also pick up stock purely through a manual StockAdjustment
+    // (no DispatchEntry involved at all) — checked the same way deleteItem
+    // checks it for items, otherwise that stock is orphaned by the delete.
+    const [hasDispatches, hasBills, hasAdjustments] = await Promise.all([
+      DispatchEntry.exists({ dairy: id }),
+      Bill.exists({ dairy: id }),
+      StockAdjustment.exists({ stockType: "dairy_item", dairy: id }),
+    ]);
+    return hasDispatches || hasBills || hasAdjustments
+      ? "This dairy has dispatch, billing, or stock-adjustment history and can't be deleted — deactivate it instead to hide it from new entries without losing past records."
+      : null;
+  },
+});
 
 exports.toggleDairyStatus = asyncHandler(async (req, res) => {
   // Atomic flip — a read-then-write would lose an update if two toggle
@@ -47,11 +62,25 @@ exports.getDairySummary = asyncHandler(async (req, res) => {
   const dairy = await Dairy.findById(req.params.id).lean();
   if (!dairy) throw new ApiError(404, "Dairy not found");
 
+  const { page = 1, limit = 10 } = req.query;
+  const pageNum = Math.max(1, parseInt(page));
+  const limitNum = Math.max(1, parseInt(limit));
+
+  // currentStockTotal is a SUM of quantity across every item (shown in the
+  // stat card) — kept accurate via its own aggregate, independent of which
+  // page of the item list is being displayed below it.
   // Dispatch/bill history are fetched separately via the paginated /dispatch
   // and /bills endpoints (?dairy=<id>) — this summary only needs aggregate
   // totals, so sum them in the database rather than loading every document.
-  const [currentStock, dispatchAgg, billAgg] = await Promise.all([
-    DairyItemStock.find({ dairy: dairy._id }).populate("item", "name code unit minStockAlert").lean(),
+  const [currentStockPage, stockCount, stockSumAgg, dispatchAgg, billAgg] = await Promise.all([
+    DairyItemStock.find({ dairy: dairy._id })
+      .populate("item", "name code unit minStockAlert")
+      .sort({ createdAt: -1 })
+      .skip((pageNum - 1) * limitNum)
+      .limit(limitNum)
+      .lean(),
+    DairyItemStock.countDocuments({ dairy: dairy._id }),
+    DairyItemStock.aggregate([{ $match: { dairy: dairy._id } }, { $group: { _id: null, total: { $sum: "$currentQty" } } }]),
     DispatchEntry.aggregate([
       { $match: { dairy: dairy._id, status: "active" } },
       { $unwind: "$items" },
@@ -70,13 +99,14 @@ exports.getDairySummary = asyncHandler(async (req, res) => {
     { $group: { _id: null, total: { $sum: "$grandTotal" } } },
   ]);
 
-  const currentStockTotal = currentStock.reduce((sum, s) => sum + s.currentQty, 0);
-
   res.status(200).json(
     new ApiResponse(200, {
       dairy,
-      currentStock,
-      currentStockTotal,
+      currentStock: currentStockPage,
+      currentStockPage: pageNum,
+      currentStockPages: Math.ceil(stockCount / limitNum) || 1,
+      currentStockCount: stockCount,
+      currentStockTotal: stockSumAgg[0]?.total || 0,
       totalDispatched: dispatchAgg[0]?.total || 0,
       totalSold: billAgg[0]?.totalQty || 0,
       totalSalesAmount: salesAmountAgg[0]?.total || 0,

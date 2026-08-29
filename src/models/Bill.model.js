@@ -23,6 +23,10 @@ const billSchema = new mongoose.Schema(
         rate: { type: Number, required: true, min: [0, "Rate cannot be negative"] },
         discount: { type: Number, default: 0, min: [0, "Discount cannot be negative"] },
         amount: { type: Number, required: true },
+        // This item's own share of gstAmount below — computed from its GST
+        // slab at the time of billing, so the printed receipt can show a
+        // per-line tax figure instead of only a bill-wide total.
+        tax: { type: Number, default: 0 },
       },
     ],
     gstEnabled: { type: Boolean, default: false },

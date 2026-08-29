@@ -9,6 +9,7 @@ const ApiResponse = require("../utils/ApiResponse");
 const ApiError = require("../utils/ApiError");
 const { nextSequence } = require("../services/sequence.service");
 const { moveMilkStock } = require("../services/stock.service");
+const { escapeRegex } = require("../utils/escapeRegex");
 
 exports.createPurchase = asyncHandler(async (req, res) => {
   const { date, billNo, vendor, quantity, unit, rate, fatDegree, otherCharges = 0, paidAmount = 0, paymentMode, dueDate, remark } = req.body;
@@ -19,6 +20,7 @@ exports.createPurchase = asyncHandler(async (req, res) => {
   const totalAmount = Number(quantity) * Number(rate);
   const netPayable = totalAmount + Number(otherCharges);
   const balance = netPayable - Number(paidAmount);
+  if (Number(paidAmount) > netPayable) throw new ApiError(400, "Paid amount cannot exceed net payable");
 
   const finalBillNo = billNo || (await nextSequence("purchase", "PUR-"));
 
@@ -41,16 +43,19 @@ exports.createPurchase = asyncHandler(async (req, res) => {
     createdBy: req.user._id,
   });
 
-  vendorDoc.currentBalance += netPayable - Number(paidAmount);
-  await vendorDoc.save();
+  const updatedVendor = await Vendor.findByIdAndUpdate(
+    vendorDoc._id,
+    { $inc: { currentBalance: netPayable - Number(paidAmount) } },
+    { new: true }
+  );
 
   await VendorLedgerEntry.create({
-    vendor: vendorDoc._id,
+    vendor: updatedVendor._id,
     date: purchase.date,
     particulars: `Milk Purchase — Bill ${finalBillNo}`,
     credit: netPayable,
     debit: paidAmount || 0,
-    balanceAfter: vendorDoc.currentBalance,
+    balanceAfter: updatedVendor.currentBalance,
     refModel: "PurchaseEntry",
     refId: purchase._id,
   });
@@ -68,7 +73,8 @@ exports.createPurchase = asyncHandler(async (req, res) => {
 });
 
 exports.getPurchases = asyncHandler(async (req, res) => {
-  const { search, vendor, from, to, page = 1, limit = 10 } = req.query;
+  let { search, vendor, from, to, page = 1, limit = 10 } = req.query;
+  if (search) search = escapeRegex(search);
   const filter = {};
   if (vendor) filter.vendor = new mongoose.Types.ObjectId(vendor);
   if (from || to) filter.date = dateRangeFilter(from, to);
@@ -184,54 +190,96 @@ exports.updatePurchase = asyncHandler(async (req, res) => {
     });
   }
 
-  // Reverse the original vendor-ledger effect, then reapply against the
-  // (possibly new) vendor — mirrors the explicit reversal pattern used by
-  // cancelPurchase. Skip entirely if nothing financial actually changed
-  // (e.g. a remark-only edit), so the ledger doesn't collect no-op entries.
-  const financialsChanged = vendorChanged || newNetPayable !== purchase.netPayable || newPaidAmount !== purchase.paidAmount;
-  if (financialsChanged) {
-    oldVendorDoc.currentBalance -= purchase.netPayable - purchase.paidAmount;
-    await oldVendorDoc.save({ validateModifiedOnly: true });
-    await VendorLedgerEntry.create({
-      vendor: oldVendorDoc._id,
-      date: new Date(),
-      particulars: `Purchase Edited — reversing original Bill ${purchase.billNo}`,
-      debit: purchase.netPayable,
-      credit: purchase.paidAmount,
-      balanceAfter: oldVendorDoc.currentBalance,
-      refModel: "PurchaseEntry",
-      refId: purchase._id,
-    });
+  try {
+    // The common case is an edit against the SAME vendor — record just the net
+    // change as one ledger entry ("what changed"), not a full reverse-then-
+    // reapply pair. A full reverse/reapply is only actually needed when the
+    // vendor itself changes, since that moves the purchase between two
+    // genuinely separate ledger accounts that can't be netted into one row.
+    if (vendorChanged) {
+      const updatedOldVendor = await Vendor.findByIdAndUpdate(
+        oldVendorDoc._id,
+        { $inc: { currentBalance: -(purchase.netPayable - purchase.paidAmount) } },
+        { new: true }
+      );
+      await VendorLedgerEntry.create({
+        vendor: updatedOldVendor._id,
+        date: new Date(),
+        particulars: `Purchase Moved to Another Vendor — reversing Bill ${purchase.billNo}`,
+        debit: purchase.netPayable,
+        credit: purchase.paidAmount,
+        balanceAfter: updatedOldVendor.currentBalance,
+        refModel: "PurchaseEntry",
+        refId: purchase._id,
+      });
 
-    newVendorDoc.currentBalance += newNetPayable - newPaidAmount;
-    await newVendorDoc.save({ validateModifiedOnly: true });
-    await VendorLedgerEntry.create({
-      vendor: newVendorDoc._id,
-      date: date || purchase.date,
-      particulars: `Milk Purchase (edited) — Bill ${purchase.billNo}`,
-      credit: newNetPayable,
-      debit: newPaidAmount,
-      balanceAfter: newVendorDoc.currentBalance,
-      refModel: "PurchaseEntry",
-      refId: purchase._id,
-    });
+      const updatedNewVendor = await Vendor.findByIdAndUpdate(
+        newVendorDoc._id,
+        { $inc: { currentBalance: newNetPayable - newPaidAmount } },
+        { new: true }
+      );
+      await VendorLedgerEntry.create({
+        vendor: updatedNewVendor._id,
+        date: date || purchase.date,
+        particulars: `Milk Purchase (moved from another vendor) — Bill ${purchase.billNo}`,
+        credit: newNetPayable,
+        debit: newPaidAmount,
+        balanceAfter: updatedNewVendor.currentBalance,
+        refModel: "PurchaseEntry",
+        refId: purchase._id,
+      });
+    } else {
+      const balanceDelta = newNetPayable - newPaidAmount - (purchase.netPayable - purchase.paidAmount);
+      if (balanceDelta !== 0) {
+        const updatedVendor = await Vendor.findByIdAndUpdate(
+          newVendorDoc._id,
+          { $inc: { currentBalance: balanceDelta } },
+          { new: true }
+        );
+        await VendorLedgerEntry.create({
+          vendor: updatedVendor._id,
+          date: date || purchase.date,
+          particulars: `Purchase Edited — Bill ${purchase.billNo} (Net Payable ₹${purchase.netPayable.toFixed(2)} → ₹${newNetPayable.toFixed(2)})`,
+          credit: balanceDelta > 0 ? balanceDelta : 0,
+          debit: balanceDelta < 0 ? -balanceDelta : 0,
+          balanceAfter: updatedVendor.currentBalance,
+          refModel: "PurchaseEntry",
+          refId: purchase._id,
+        });
+      }
+    }
+
+    purchase.date = date || purchase.date;
+    purchase.vendor = newVendorId;
+    purchase.quantity = newQuantity;
+    purchase.unit = unit || purchase.unit;
+    purchase.rate = newRate;
+    purchase.fatDegree = fatDegree === "" || fatDegree === undefined ? purchase.fatDegree : fatDegree;
+    purchase.totalAmount = newTotalAmount;
+    purchase.otherCharges = newOtherCharges;
+    purchase.netPayable = newNetPayable;
+    purchase.paidAmount = newPaidAmount;
+    purchase.balance = newBalance;
+    purchase.paymentMode = paymentMode || purchase.paymentMode;
+    purchase.dueDate = dueDate !== undefined ? dueDate || null : purchase.dueDate;
+    purchase.remark = remark;
+    await purchase.save({ validateModifiedOnly: true });
+  } catch (err) {
+    // The stock move above already committed — if anything after it fails,
+    // reverse that stock delta rather than leave StockLedger/MilkStock
+    // reflecting a change for a purchase edit that never actually saved.
+    if (quantityDelta !== 0) {
+      await moveMilkStock({
+        quantity: -quantityDelta,
+        transactionType: "adjustment",
+        refModel: "PurchaseEntry",
+        refId: purchase._id,
+        remark: `Reversal — edit to Bill ${purchase.billNo} failed after stock was adjusted`,
+        createdBy: req.user._id,
+      });
+    }
+    throw err;
   }
-
-  purchase.date = date || purchase.date;
-  purchase.vendor = newVendorId;
-  purchase.quantity = newQuantity;
-  purchase.unit = unit || purchase.unit;
-  purchase.rate = newRate;
-  purchase.fatDegree = fatDegree === "" || fatDegree === undefined ? purchase.fatDegree : fatDegree;
-  purchase.totalAmount = newTotalAmount;
-  purchase.otherCharges = newOtherCharges;
-  purchase.netPayable = newNetPayable;
-  purchase.paidAmount = newPaidAmount;
-  purchase.balance = newBalance;
-  purchase.paymentMode = paymentMode || purchase.paymentMode;
-  purchase.dueDate = dueDate || null;
-  purchase.remark = remark;
-  await purchase.save({ validateModifiedOnly: true });
 
   res.status(200).json(new ApiResponse(200, purchase, "Purchase entry updated"));
 });
@@ -253,9 +301,10 @@ exports.cancelPurchase = asyncHandler(async (req, res) => {
   }
 
   try {
-    // If this milk has already been used in production, we can't reverse it —
-    // catching that here rolls the claim back below instead of leaving the
-    // record cancelled with nothing actually reversed.
+    // A quick, friendly pre-check for the common case (this is NOT the
+    // authoritative check — it's just here to give a clear error message
+    // before touching anything). The real, race-safe enforcement is
+    // moveMilkStock's own atomic conditional $inc below.
     const milkStock = await MilkStock.findOne({ key: "central" });
     const availableMilk = milkStock?.currentQty || 0;
     if (availableMilk < purchase.quantity) {
@@ -265,21 +314,11 @@ exports.cancelPurchase = asyncHandler(async (req, res) => {
       );
     }
 
-    const vendorDoc = await Vendor.findById(purchase.vendor);
-    vendorDoc.currentBalance -= purchase.netPayable - purchase.paidAmount;
-    await vendorDoc.save({ validateModifiedOnly: true });
-
-    await VendorLedgerEntry.create({
-      vendor: vendorDoc._id,
-      date: new Date(),
-      particulars: `Purchase Cancelled — Bill ${purchase.billNo}`,
-      debit: purchase.netPayable,
-      credit: purchase.paidAmount,
-      balanceAfter: vendorDoc.currentBalance,
-      refModel: "PurchaseEntry",
-      refId: purchase._id,
-    });
-
+    // Stock first: it's the atomic, authoritative check, and the one most
+    // likely to fail (e.g. a concurrent production run consumed the milk
+    // between the pre-check above and here). Vendor balance/ledger only get
+    // touched once the reversal has actually succeeded, so a failure here
+    // leaves nothing else committed for the catch block below to undo.
     await moveMilkStock({
       quantity: -purchase.quantity,
       transactionType: "adjustment",
@@ -287,6 +326,23 @@ exports.cancelPurchase = asyncHandler(async (req, res) => {
       refId: purchase._id,
       remark: `Reversal — Purchase cancelled (Bill ${purchase.billNo})`,
       createdBy: req.user._id,
+    });
+
+    const updatedVendor = await Vendor.findByIdAndUpdate(
+      purchase.vendor,
+      { $inc: { currentBalance: -(purchase.netPayable - purchase.paidAmount) } },
+      { new: true }
+    );
+
+    await VendorLedgerEntry.create({
+      vendor: updatedVendor._id,
+      date: new Date(),
+      particulars: `Purchase Cancelled — Bill ${purchase.billNo}`,
+      debit: purchase.netPayable,
+      credit: purchase.paidAmount,
+      balanceAfter: updatedVendor.currentBalance,
+      refModel: "PurchaseEntry",
+      refId: purchase._id,
     });
   } catch (err) {
     await PurchaseEntry.findByIdAndUpdate(purchase._id, { status: "active" });

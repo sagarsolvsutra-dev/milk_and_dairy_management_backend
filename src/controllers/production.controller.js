@@ -8,6 +8,7 @@ const ApiError = require("../utils/ApiError");
 const { nextSequence } = require("../services/sequence.service");
 const { moveMilkStock, moveCentralItemStock } = require("../services/stock.service");
 const { dateRangeFilter } = require("../utils/dateRangeFilter");
+const { escapeRegex } = require("../utils/escapeRegex");
 
 exports.createProduction = asyncHandler(async (req, res) => {
   const { date, items = [], remark } = req.body;
@@ -71,7 +72,8 @@ exports.createProduction = asyncHandler(async (req, res) => {
 });
 
 exports.getProductions = asyncHandler(async (req, res) => {
-  const { search, from, to, page = 1, limit = 10 } = req.query;
+  let { search, from, to, page = 1, limit = 10 } = req.query;
+  if (search) search = escapeRegex(search);
   const filter = {};
   if (search) {
     const matchingItems = await Item.find({
@@ -147,8 +149,20 @@ exports.updateProduction = asyncHandler(async (req, res) => {
   // Only move stock for the DIFFERENCE per item — touching unchanged items would
   // needlessly demand their full original quantity still be sitting in central
   // stock, blocking even a remark-only edit once anything has been dispatched.
-  const oldQtyByItem = new Map(production.items.map((row) => [String(row.item), Number(row.quantity)]));
-  const newQtyByItem = new Map(resolvedItems.map((row) => [String(row.item), Number(row.quantity)]));
+  // Sum (not overwrite) quantities per item id — an entry can legitimately list
+  // the same item on more than one row, and a plain `new Map(...)` would keep
+  // only the last row's quantity, silently dropping the earlier rows from the
+  // delta math while they'd still be saved on the document itself.
+  const sumQtyByItem = (rows) => {
+    const map = new Map();
+    for (const row of rows) {
+      const key = String(row.item);
+      map.set(key, (map.get(key) || 0) + Number(row.quantity));
+    }
+    return map;
+  };
+  const oldQtyByItem = sumQtyByItem(production.items);
+  const newQtyByItem = sumQtyByItem(resolvedItems);
   const itemIds = new Set([...oldQtyByItem.keys(), ...newQtyByItem.keys()]);
   const itemDeltas = [...itemIds]
     .map((itemId) => ({ itemId, delta: (newQtyByItem.get(itemId) || 0) - (oldQtyByItem.get(itemId) || 0) }))
@@ -202,7 +216,7 @@ exports.updateProduction = asyncHandler(async (req, res) => {
   production.date = date || production.date;
   production.items = resolvedItems;
   production.totalMilkConsumed = newTotalMilkConsumed;
-  production.remark = remark;
+  production.remark = remark ?? production.remark;
   await production.save({ validateModifiedOnly: true });
 
   res.status(200).json(new ApiResponse(200, production, "Production entry updated"));

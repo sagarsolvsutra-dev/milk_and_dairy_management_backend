@@ -11,6 +11,7 @@ const ApiError = require("../utils/ApiError");
 const { nextSequence } = require("../services/sequence.service");
 const { moveCentralItemStock, moveDairyItemStock } = require("../services/stock.service");
 const { dateRangeFilter } = require("../utils/dateRangeFilter");
+const { escapeRegex } = require("../utils/escapeRegex");
 
 exports.createDispatch = asyncHandler(async (req, res) => {
   const { date, dairy, items = [], vehicleNo, driverName, remark } = req.body;
@@ -92,7 +93,8 @@ exports.createDispatch = asyncHandler(async (req, res) => {
 });
 
 exports.getDispatches = asyncHandler(async (req, res) => {
-  const { search, dairy, from, to, page = 1, limit = 10 } = req.query;
+  let { search, dairy, from, to, page = 1, limit = 10 } = req.query;
+  if (search) search = escapeRegex(search);
   const filter = {};
   if (dairy) filter.dairy = new mongoose.Types.ObjectId(dairy);
   if (search) {
@@ -199,8 +201,15 @@ exports.updateDispatch = asyncHandler(async (req, res) => {
     }
     const projectedCentral = new Map();
     for (const row of dispatch.items) {
-      const stock = await CentralItemStock.findOne({ item: row.item });
-      projectedCentral.set(String(row.item), (stock?.currentQty || 0) + Number(row.quantity));
+      const key = String(row.item);
+      // Sum, not overwrite — the original dispatch can list the same item on
+      // more than one row, and each row's quantity is separately headed back
+      // to central stock once the reversal below runs.
+      if (!projectedCentral.has(key)) {
+        const stock = await CentralItemStock.findOne({ item: row.item });
+        projectedCentral.set(key, stock?.currentQty || 0);
+      }
+      projectedCentral.set(key, projectedCentral.get(key) + Number(row.quantity));
     }
     for (const row of resolvedItems) {
       let base = projectedCentral.get(row.item);
@@ -262,8 +271,20 @@ exports.updateDispatch = asyncHandler(async (req, res) => {
     // unchanged items would needlessly demand their full original quantity
     // still be sitting at the dairy, blocking even a remark-only edit once
     // any item has been sold/used.
-    const oldQtyByItem = new Map(dispatch.items.map((row) => [String(row.item), Number(row.quantity)]));
-    const newQtyByItem = new Map(resolvedItems.map((row) => [row.item, row.quantity]));
+    // Sum (not overwrite) quantities per item id — an entry can legitimately
+    // list the same item on more than one row, and a plain `new Map(...)`
+    // would keep only the last row's quantity, silently dropping the earlier
+    // rows from the delta math while they'd still be saved on the document.
+    const sumQtyByItem = (rows) => {
+      const map = new Map();
+      for (const row of rows) {
+        const key = String(row.item);
+        map.set(key, (map.get(key) || 0) + Number(row.quantity));
+      }
+      return map;
+    };
+    const oldQtyByItem = sumQtyByItem(dispatch.items);
+    const newQtyByItem = sumQtyByItem(resolvedItems);
     const itemIds = new Set([...oldQtyByItem.keys(), ...newQtyByItem.keys()]);
     const itemDeltas = [...itemIds]
       .map((itemId) => ({ itemId, delta: (newQtyByItem.get(itemId) || 0) - (oldQtyByItem.get(itemId) || 0) }))

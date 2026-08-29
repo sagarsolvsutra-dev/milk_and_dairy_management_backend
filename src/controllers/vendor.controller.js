@@ -1,9 +1,11 @@
 const Vendor = require("../models/Vendor.model");
 const VendorLedgerEntry = require("../models/VendorLedgerEntry.model");
+const PurchaseEntry = require("../models/PurchaseEntry.model");
 const asyncHandler = require("../utils/asyncHandler");
 const ApiResponse = require("../utils/ApiResponse");
 const ApiError = require("../utils/ApiError");
 const { dateRangeFilter } = require("../utils/dateRangeFilter");
+const { escapeRegex } = require("../utils/escapeRegex");
 const factory = require("./factory.controller");
 
 exports.createVendor = asyncHandler(async (req, res) => {
@@ -43,14 +45,22 @@ exports.updateVendor = asyncHandler(async (req, res) => {
   if (!vendor) throw new ApiError(404, "Vendor not found");
   res.status(200).json(new ApiResponse(200, vendor, "Vendor updated successfully"));
 });
-exports.deleteVendor = factory.deleteOne(Vendor, "Vendor");
+exports.deleteVendor = factory.deleteOne(Vendor, "Vendor", {
+  checkDependents: async (id) => {
+    const hasPurchases = await PurchaseEntry.exists({ vendor: id });
+    return hasPurchases
+      ? "This vendor has purchase history and can't be deleted — deactivate it instead to hide it from new entries without losing past records."
+      : null;
+  },
+});
 exports.toggleVendorStatus = factory.toggleStatus(Vendor, "Vendor");
 
 exports.getVendorLedger = asyncHandler(async (req, res) => {
   const vendor = await Vendor.findById(req.params.id).lean();
   if (!vendor) throw new ApiError(404, "Vendor not found");
 
-  const { search, from, to, page = 1, limit = 10 } = req.query;
+  let { search, from, to, page = 1, limit = 10 } = req.query;
+  if (search) search = escapeRegex(search);
   const filter = { vendor: vendor._id };
   if (search) {
     filter.$or = [
@@ -65,7 +75,7 @@ exports.getVendorLedger = asyncHandler(async (req, res) => {
 
   const [entries, total] = await Promise.all([
     VendorLedgerEntry.find(filter)
-      .sort({ date: 1, createdAt: 1 })
+      .sort({ date: -1, createdAt: -1 })
       .skip((pageNum - 1) * limitNum)
       .limit(limitNum)
       .lean(),

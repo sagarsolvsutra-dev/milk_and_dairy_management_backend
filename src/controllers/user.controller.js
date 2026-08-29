@@ -4,6 +4,7 @@ const LoginHistory = require("../models/LoginHistory.model");
 const asyncHandler = require("../utils/asyncHandler");
 const ApiResponse = require("../utils/ApiResponse");
 const ApiError = require("../utils/ApiError");
+const { escapeRegex } = require("../utils/escapeRegex");
 
 exports.createUser = asyncHandler(async (req, res) => {
   const user = await User.create({ ...req.body, role: "staff", createdBy: req.user._id });
@@ -13,7 +14,8 @@ exports.createUser = asyncHandler(async (req, res) => {
 // Team management only ever lists/edits staff accounts — the Super Admin's own
 // account is not manageable from this screen.
 exports.getUsers = asyncHandler(async (req, res) => {
-  const { search = "", page = 1, limit = 10, isActive } = req.query;
+  let { search = "", page = 1, limit = 10, isActive } = req.query;
+  if (search) search = escapeRegex(search);
   const filter = { role: "staff" };
 
   if (search) {

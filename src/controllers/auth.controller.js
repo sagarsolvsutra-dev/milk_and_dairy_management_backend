@@ -1,3 +1,4 @@
+const jwt = require("jsonwebtoken");
 const User = require("../models/User.model");
 const Dairy = require("../models/Dairy.model");
 const LoginHistory = require("../models/LoginHistory.model");
@@ -95,6 +96,57 @@ exports.getMe = asyncHandler(async (req, res) => {
       permissions: req.user.permissions || [],
     })
   );
+});
+
+exports.refresh = asyncHandler(async (req, res) => {
+  const token = req.cookies?.refreshToken;
+  if (!token) throw new ApiError(401, "No refresh token — please login again");
+
+  let decoded;
+  try {
+    decoded = jwt.verify(token, process.env.JWT_REFRESH_SECRET);
+  } catch (err) {
+    const message = err.name === "TokenExpiredError" ? "Refresh token expired" : "Invalid refresh token";
+    throw new ApiError(401, `${message} — please login again`);
+  }
+
+  const Model = decoded.authType === "dairy" ? Dairy : User;
+  const account = await Model.findById(decoded.id);
+  if (!account) throw new ApiError(401, "Account not found — please login again");
+  // Re-check active status — the account could have been deactivated since
+  // the refresh token was issued, and a stale refresh token shouldn't be able
+  // to keep minting valid access tokens for a now-deactivated account.
+  if (decoded.authType === "dairy" ? account.status !== "active" : !account.isActive) {
+    throw new ApiError(403, "Account deactivated — please contact admin");
+  }
+
+  const role = decoded.authType === "dairy" ? "dairy_user" : account.role;
+  const dairyId = decoded.authType === "dairy" ? account._id : account.dairy;
+
+  const accessToken = generateAccessToken({ id: account._id, role, dairy: dairyId, authType: decoded.authType });
+  // Rotate the refresh token too, rather than reusing the same one across
+  // every refresh for its full 7-day life.
+  const refreshToken = generateRefreshToken({ id: account._id, authType: decoded.authType });
+
+  res
+    .cookie("accessToken", accessToken, { ...cookieOptions, maxAge: 24 * 60 * 60 * 1000 })
+    .cookie("refreshToken", refreshToken, { ...cookieOptions, maxAge: 7 * 24 * 60 * 60 * 1000 })
+    .status(200)
+    .json(
+      new ApiResponse(200, {
+        accessToken,
+        user: {
+          id: account._id,
+          name: account.name,
+          email: account.email || null,
+          loginId: account.loginId,
+          role,
+          dairy: dairyId,
+          roleTitle: account.roleTitle || null,
+          permissions: account.permissions || [],
+        },
+      })
+    );
 });
 
 exports.logout = asyncHandler(async (req, res) => {

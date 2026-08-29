@@ -1,6 +1,7 @@
 const asyncHandler = require("../utils/asyncHandler");
 const ApiResponse = require("../utils/ApiResponse");
 const ApiError = require("../utils/ApiError");
+const { escapeRegex } = require("../utils/escapeRegex");
 
 const createOne = (Model, label = "Record") =>
   asyncHandler(async (req, res) => {
@@ -14,7 +15,8 @@ const getAll = (Model, { searchFields = [], populate = [] } = {}) =>
     const filter = {};
 
     if (search && searchFields.length) {
-      filter.$or = searchFields.map((f) => ({ [f]: { $regex: search, $options: "i" } }));
+      const safeSearch = escapeRegex(search);
+      filter.$or = searchFields.map((f) => ({ [f]: { $regex: safeSearch, $options: "i" } }));
     }
     if (isActive !== undefined) filter.isActive = isActive === "true";
     // Models like Dairy use a "status: active/inactive" string instead of an isActive boolean.
@@ -63,8 +65,19 @@ const updateOne = (Model, label = "Record") =>
     res.status(200).json(new ApiResponse(200, doc, `${label} updated successfully`));
   });
 
-const deleteOne = (Model, label = "Record") =>
+// `checkDependents(id)` — an optional guard resolving to an error message
+// string if this record is still referenced elsewhere (and so must not be
+// hard-deleted), or a falsy value if it's safe to delete. Without this, a
+// deleted-but-still-referenced record populates as `null` everywhere it's
+// linked from (a purchase's vendor, a bill's item, ...) — `typeof null` is
+// `"object"` in JS, so naive `typeof x === "object"` checks on the frontend
+// treat it as present and crash reading `.name` off it.
+const deleteOne = (Model, label = "Record", { checkDependents } = {}) =>
   asyncHandler(async (req, res) => {
+    if (checkDependents) {
+      const blockedReason = await checkDependents(req.params.id);
+      if (blockedReason) throw new ApiError(400, blockedReason);
+    }
     const doc = await Model.findByIdAndDelete(req.params.id);
     if (!doc) throw new ApiError(404, `${label} not found`);
     res.status(200).json(new ApiResponse(200, null, `${label} deleted successfully`));

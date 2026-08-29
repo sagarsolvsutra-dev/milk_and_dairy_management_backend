@@ -65,6 +65,11 @@ exports.dispatchReport = asyncHandler(async (req, res) => {
   // effect was already reversed, so it shouldn't still count toward totals.
   const filter = { ...dateFilter(from, to), status: "active" };
   if (dairy) filter.dairy = dairy;
+  // Filter at the query level, before skip/limit — filtering the fetched page
+  // afterward in JS would paginate over the UNFILTERED set, so a later page
+  // could come back short (or empty) even though more matching entries exist
+  // on pages that were never fetched, and `total`/`pages` would be wrong.
+  if (item) filter["items.item"] = item;
   const { page, limit, skip } = paginate(req.query);
 
   const [rawEntries, total] = await Promise.all([
@@ -78,12 +83,11 @@ exports.dispatchReport = asyncHandler(async (req, res) => {
     DispatchEntry.countDocuments(filter),
   ]);
 
-  let entries = rawEntries;
-  if (item) {
-    entries = rawEntries
-      .map((e) => ({ ...e, items: e.items.filter((i) => String(i.item._id) === item) }))
-      .filter((e) => e.items.length);
-  }
+  // Every returned entry already contains the requested item — this just
+  // narrows what's displayed within each entry down to that item's row(s).
+  const entries = item
+    ? rawEntries.map((e) => ({ ...e, items: e.items.filter((i) => String(i.item._id) === item) }))
+    : rawEntries;
 
   res.status(200).json(new ApiResponse(200, { entries, total, page, pages: Math.ceil(total / limit) || 1 }));
 });
@@ -110,8 +114,9 @@ exports.itemWiseSalesReport = asyncHandler(async (req, res) => {
   const dairy = scopeDairy(req);
   const match = { ...dateFilter(from, to), status: "active" };
   if (dairy) match.dairy = dairy;
+  const { page, limit, skip } = paginate(req.query);
 
-  const result = await Bill.aggregate([
+  const [result] = await Bill.aggregate([
     { $match: match },
     { $unwind: "$items" },
     {
@@ -125,21 +130,25 @@ exports.itemWiseSalesReport = asyncHandler(async (req, res) => {
     { $unwind: "$item" },
     { $project: { itemName: "$item.name", itemCode: "$item.code", totalQty: 1, totalAmount: 1 } },
     { $sort: { totalAmount: -1 } },
+    { $facet: { items: [{ $skip: skip }, { $limit: limit }], totalCount: [{ $count: "count" }] } },
   ]);
 
-  res.status(200).json(new ApiResponse(200, result));
+  const total = result.totalCount[0]?.count || 0;
+  res.status(200).json(new ApiResponse(200, { items: result.items, total, page, pages: Math.ceil(total / limit) || 1 }));
 });
 
 exports.stockReport = asyncHandler(async (req, res) => {
   const dairy = scopeDairy(req);
+  const { page, limit, skip } = paginate(req.query);
+  const Model = dairy ? DairyItemStock : CentralItemStock;
+  const filter = dairy ? { dairy } : {};
 
-  if (dairy) {
-    const stocks = await DairyItemStock.find({ dairy }).populate("item", "name code unit minStockAlert").lean();
-    return res.status(200).json(new ApiResponse(200, stocks));
-  }
+  const [items, total] = await Promise.all([
+    Model.find(filter).populate("item", "name code unit minStockAlert").sort({ createdAt: -1 }).skip(skip).limit(limit).lean(),
+    Model.countDocuments(filter),
+  ]);
 
-  const stocks = await CentralItemStock.find().populate("item", "name code unit minStockAlert").lean();
-  res.status(200).json(new ApiResponse(200, stocks));
+  res.status(200).json(new ApiResponse(200, { items, total, page, pages: Math.ceil(total / limit) || 1 }));
 });
 
 exports.monthlyYearlyReport = asyncHandler(async (req, res) => {

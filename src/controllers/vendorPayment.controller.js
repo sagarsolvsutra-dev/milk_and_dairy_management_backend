@@ -20,6 +20,13 @@ exports.createPayment = asyncHandler(async (req, res) => {
   // adjustedBills entry pointing at another vendor's purchase would mark
   // that purchase paid down without ever touching that vendor's own balance
   // or ledger, leaving the two permanently out of sync.
+  //
+  // claimedByPurchase tracks how much THIS request has already applied to
+  // each purchase id — checking adj.amount against purchase.balance alone
+  // (the DB value, unmodified until after this loop) would let two
+  // adjustedBills entries for the same bill each pass the same balance
+  // check and together over-claim it.
+  const claimedByPurchase = new Map();
   const purchaseDocs = [];
   for (const adj of adjustedBills) {
     const purchase = await PurchaseEntry.findById(adj.purchaseEntry);
@@ -29,10 +36,23 @@ exports.createPayment = asyncHandler(async (req, res) => {
     }
     if (purchase.status === "cancelled") throw new ApiError(400, `Purchase ${purchase.billNo} is cancelled`);
     if (Number(adj.amount) <= 0) throw new ApiError(400, `Adjustment amount for ${purchase.billNo} must be greater than zero`);
-    if (Number(adj.amount) > purchase.balance) {
-      throw new ApiError(400, `Adjustment amount for ${purchase.billNo} exceeds its outstanding balance of ${purchase.balance}`);
+
+    const purchaseId = String(purchase._id);
+    const alreadyClaimed = claimedByPurchase.get(purchaseId) || 0;
+    const remainingBalance = purchase.balance - alreadyClaimed;
+    if (Number(adj.amount) > remainingBalance) {
+      throw new ApiError(400, `Adjustment amount for ${purchase.billNo} exceeds its outstanding balance of ${remainingBalance}`);
     }
+    claimedByPurchase.set(purchaseId, alreadyClaimed + Number(adj.amount));
     purchaseDocs.push(purchase);
+  }
+
+  const totalAdjusted = adjustedBills.reduce((sum, adj) => sum + Number(adj.amount), 0);
+  if (adjustedBills.length && Math.abs(totalAdjusted - Number(amount)) > 0.01) {
+    throw new ApiError(
+      400,
+      `Adjusted bill amounts (${totalAdjusted}) must add up to the payment amount (${Number(amount)})`
+    );
   }
 
   const payment = await VendorPayment.create({
@@ -52,15 +72,18 @@ exports.createPayment = asyncHandler(async (req, res) => {
     });
   }
 
-  vendorDoc.currentBalance -= Number(amount);
-  await vendorDoc.save();
+  const updatedVendor = await Vendor.findByIdAndUpdate(
+    vendorDoc._id,
+    { $inc: { currentBalance: -Number(amount) } },
+    { new: true }
+  );
 
   await VendorLedgerEntry.create({
-    vendor: vendorDoc._id,
+    vendor: updatedVendor._id,
     date: payment.date,
     particulars: `Payment Made${referenceNo ? ` — Ref ${referenceNo}` : ""}`,
     debit: amount,
-    balanceAfter: vendorDoc.currentBalance,
+    balanceAfter: updatedVendor.currentBalance,
     refModel: "VendorPayment",
     refId: payment._id,
   });
@@ -91,7 +114,19 @@ exports.getPayments = asyncHandler(async (req, res) => {
 });
 
 exports.getOutstandingReport = asyncHandler(async (req, res) => {
-  const vendors = await Vendor.find({ currentBalance: { $ne: 0 } }).sort({ currentBalance: -1 }).lean();
+  const { page = 1, limit = 10 } = req.query;
+  const pageNum = Math.max(1, parseInt(page));
+  const limitNum = Math.max(1, parseInt(limit));
+
+  const filter = { currentBalance: { $ne: 0 } };
+  const [vendors, total] = await Promise.all([
+    Vendor.find(filter)
+      .sort({ currentBalance: -1 })
+      .skip((pageNum - 1) * limitNum)
+      .limit(limitNum)
+      .lean(),
+    Vendor.countDocuments(filter),
+  ]);
   const now = new Date();
 
   const report = await Promise.all(
@@ -120,5 +155,5 @@ exports.getOutstandingReport = asyncHandler(async (req, res) => {
     })
   );
 
-  res.status(200).json(new ApiResponse(200, report));
+  res.status(200).json(new ApiResponse(200, { items: report, total, page: pageNum, pages: Math.ceil(total / limitNum) || 1 }));
 });

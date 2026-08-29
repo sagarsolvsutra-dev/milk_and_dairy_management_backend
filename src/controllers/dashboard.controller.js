@@ -15,28 +15,63 @@ const startOfToday = () => {
   return d;
 };
 
+// Low stock preview lists on a dashboard are a summary, not the full picture —
+// cap what's shown but always sort so the cap keeps the most urgent items,
+// never an arbitrary slice by insertion order.
+const DASHBOARD_ALERT_PREVIEW_LIMIT = 8;
+
+// A proper (a, b) comparator, not a single-argument key extractor — Array.sort
+// calls its callback with two elements and expects their relative order back;
+// a function that only reads its first argument returns the same value
+// regardless of what it's compared against and doesn't actually sort past
+// the first element.
+const deficit = (s) => s.currentQty - s.item.minStockAlert;
+const bySeverity = (a, b) => deficit(a) - deficit(b);
+
 exports.getSuperAdminDashboard = asyncHandler(async (req, res) => {
   const today = startOfToday();
 
-  const [todayPurchase, milkStock, todayProduction, vendorsWithDue, activeDairies, totalDairies, centralStocks] =
-    await Promise.all([
-      PurchaseEntry.aggregate([
-        { $match: { date: { $gte: today }, status: "active" } },
-        { $group: { _id: null, totalQty: { $sum: "$quantity" }, totalAmount: { $sum: "$netPayable" } } },
-      ]),
-      MilkStock.findOne({ key: "central" }).lean(),
-      ProductionEntry.aggregate([
-        { $match: { date: { $gte: today }, status: "active" } },
-        { $unwind: "$items" },
-        { $group: { _id: "$items.item", quantity: { $sum: "$items.quantity" } } },
-      ]),
-      Vendor.countDocuments({ currentBalance: { $gt: 0 } }),
-      Dairy.countDocuments({ status: "active" }),
-      Dairy.countDocuments(),
-      CentralItemStock.find().populate("item", "name minStockAlert").lean(),
-    ]);
+  const [
+    todayPurchase,
+    milkStock,
+    todayProduction,
+    vendorsWithDue,
+    activeDairies,
+    totalDairies,
+    centralStocks,
+    dairyLowStockSummary,
+  ] = await Promise.all([
+    PurchaseEntry.aggregate([
+      { $match: { date: { $gte: today }, status: "active" } },
+      { $group: { _id: null, totalQty: { $sum: "$quantity" }, totalAmount: { $sum: "$netPayable" } } },
+    ]),
+    MilkStock.findOne({ key: "central" }).lean(),
+    ProductionEntry.aggregate([
+      { $match: { date: { $gte: today }, status: "active" } },
+      { $unwind: "$items" },
+      { $group: { _id: "$items.item", quantity: { $sum: "$items.quantity" } } },
+    ]),
+    Vendor.countDocuments({ currentBalance: { $gt: 0 } }),
+    Dairy.countDocuments({ status: "active" }),
+    Dairy.countDocuments(),
+    CentralItemStock.find().populate("item", "name code minStockAlert").lean(),
+    // Per-dairy breakdown — the admin dashboard previously only ever looked at
+    // central stock, so a dairy could run critically low on an item with no
+    // visibility from here at all.
+    DairyItemStock.aggregate([
+      { $lookup: { from: "items", localField: "item", foreignField: "_id", as: "item" } },
+      { $unwind: "$item" },
+      { $match: { $expr: { $lte: ["$currentQty", "$item.minStockAlert"] } } },
+      { $group: { _id: "$dairy", count: { $sum: 1 } } },
+      { $lookup: { from: "dairies", localField: "_id", foreignField: "_id", as: "dairy" } },
+      { $unwind: "$dairy" },
+      { $project: { _id: 0, dairy: { _id: "$dairy._id", name: "$dairy.name", code: "$dairy.code" }, count: 1 } },
+      { $sort: { count: -1 } },
+    ]),
+  ]);
 
-  const lowStockItems = centralStocks.filter((s) => s.item && s.currentQty <= s.item.minStockAlert);
+  const lowStockItems = centralStocks.filter((s) => s.item && s.currentQty <= s.item.minStockAlert).sort(bySeverity);
+  const dairyLowStockCount = dairyLowStockSummary.reduce((sum, d) => sum + d.count, 0);
 
   res.status(200).json(
     new ApiResponse(200, {
@@ -48,7 +83,9 @@ exports.getSuperAdminDashboard = asyncHandler(async (req, res) => {
       activeDairies,
       totalDairies,
       lowStockItemsCount: lowStockItems.length,
-      lowStockItems: lowStockItems.slice(0, 10),
+      lowStockItems: lowStockItems.slice(0, DASHBOARD_ALERT_PREVIEW_LIMIT),
+      dairyLowStockCount,
+      dairyLowStockSummary,
     })
   );
 });
@@ -66,7 +103,7 @@ exports.getDairyDashboard = asyncHandler(async (req, res) => {
     Bill.find({ dairy }).sort({ createdAt: -1 }).limit(5).lean(),
   ]);
 
-  const lowStockItems = stocks.filter((s) => s.item && s.currentQty <= s.item.minStockAlert);
+  const lowStockItems = stocks.filter((s) => s.item && s.currentQty <= s.item.minStockAlert).sort(bySeverity);
 
   res.status(200).json(
     new ApiResponse(200, {
@@ -74,7 +111,8 @@ exports.getDairyDashboard = asyncHandler(async (req, res) => {
       todayBillCount: todayBills[0]?.count || 0,
       todaySalesAmount: todayBills[0]?.total || 0,
       recentBills,
-      lowStockItems,
+      lowStockItemsCount: lowStockItems.length,
+      lowStockItems: lowStockItems.slice(0, DASHBOARD_ALERT_PREVIEW_LIMIT),
     })
   );
 });

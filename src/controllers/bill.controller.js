@@ -9,6 +9,7 @@ const { nextSequence } = require("../services/sequence.service");
 const { moveDairyItemStock } = require("../services/stock.service");
 const { generateBillPdf } = require("../services/billPdf.service");
 const { dateRangeFilter } = require("../utils/dateRangeFilter");
+const { escapeRegex } = require("../utils/escapeRegex");
 
 // req.body is undefined (not {}) on a bodyless GET under Express 5 — guard it
 // rather than assume every request carries a parsed body.
@@ -41,8 +42,9 @@ exports.createBill = asyncHandler(async (req, res) => {
     const amount = quantity * rate - discount;
     if (amount < 0) throw new ApiError(400, `Discount cannot exceed quantity × rate (row ${idx + 1})`);
     subtotal += amount;
-    if (gstEnabled) gstAmount += (amount * (itemDoc.gstSlab?.percent || 0)) / 100;
-    return { ...row, quantity, rate, discount, amount };
+    const tax = gstEnabled ? Math.round(((amount * (itemDoc.gstSlab?.percent || 0)) / 100) * 100) / 100 : 0;
+    gstAmount += tax;
+    return { ...row, quantity, rate, discount, amount, tax };
   });
   gstAmount = gstEnabled ? Math.round(gstAmount * 100) / 100 : 0;
   // Round-off exists to absorb paise-level rounding, not to be a second
@@ -112,7 +114,8 @@ exports.createBill = asyncHandler(async (req, res) => {
 
 exports.getBills = asyncHandler(async (req, res) => {
   const dairy = resolveDairyId(req);
-  const { search, from, to, page = 1, limit = 10 } = req.query;
+  let { search, from, to, page = 1, limit = 10 } = req.query;
+  if (search) search = escapeRegex(search);
   const filter = {};
   if (dairy) filter.dairy = new mongoose.Types.ObjectId(dairy);
   if (search) {
@@ -176,13 +179,17 @@ exports.getBills = asyncHandler(async (req, res) => {
 });
 
 exports.getBill = asyncHandler(async (req, res) => {
-  const bill = await Bill.findById(req.params.id).populate("dairy", "name code").populate("items.item", "name code unit").lean();
+  const filter = { _id: req.params.id };
+  if (req.user.role === "dairy_user") filter.dairy = req.user.dairy;
+  const bill = await Bill.findOne(filter).populate("dairy", "name code").populate("items.item", "name code unit").lean();
   if (!bill) throw new ApiError(404, "Bill not found");
   res.status(200).json(new ApiResponse(200, bill));
 });
 
 exports.downloadBillPdf = asyncHandler(async (req, res) => {
-  const bill = await Bill.findById(req.params.id).populate("dairy", "name code address mobile").populate("items.item", "name code unit").lean();
+  const filter = { _id: req.params.id };
+  if (req.user.role === "dairy_user") filter.dairy = req.user.dairy;
+  const bill = await Bill.findOne(filter).populate("dairy", "name code address mobile").populate("items.item", "name code unit").lean();
   if (!bill) throw new ApiError(404, "Bill not found");
 
   res.setHeader("Content-Type", "application/pdf");
@@ -194,14 +201,17 @@ exports.cancelBill = asyncHandler(async (req, res) => {
   // Atomically claim the cancel — the first request to flip status "active" ->
   // "cancelled" wins; a concurrent duplicate request gets null back here and
   // stops before touching any stock, instead of both racing past a
-  // findById-then-save check and double-reversing the stock.
-  const bill = await Bill.findOneAndUpdate(
-    { _id: req.params.id, status: "active" },
-    { status: "cancelled" },
-    { new: false }
-  );
+  // findById-then-save check and double-reversing the stock. The dairy filter
+  // (for a dairy_user) is part of the SAME atomic claim, so a branch account
+  // can't cancel — or discover the existence/status of — another dairy's bill.
+  const claimFilter = { _id: req.params.id, status: "active" };
+  if (req.user.role === "dairy_user") claimFilter.dairy = req.user.dairy;
+
+  const bill = await Bill.findOneAndUpdate(claimFilter, { status: "cancelled" }, { new: false });
   if (!bill) {
-    const exists = await Bill.exists({ _id: req.params.id });
+    const existsFilter = { _id: req.params.id };
+    if (req.user.role === "dairy_user") existsFilter.dairy = req.user.dairy;
+    const exists = await Bill.exists(existsFilter);
     if (!exists) throw new ApiError(404, "Bill not found");
     throw new ApiError(400, "Bill already cancelled");
   }
