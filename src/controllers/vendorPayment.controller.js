@@ -66,27 +66,60 @@ exports.createPayment = asyncHandler(async (req, res) => {
     createdBy: req.user._id,
   });
 
-  for (const adj of adjustedBills) {
-    await PurchaseEntry.findByIdAndUpdate(adj.purchaseEntry, {
-      $inc: { paidAmount: adj.amount, balance: -adj.amount },
+  // Each purchase update below is atomic and conditional (mirrors the stock
+  // movers' own pattern) — a plain $inc with no guard would let two
+  // concurrent payments against the same bill both pass their own stale
+  // pre-check above and together push its balance negative.
+  const appliedPurchaseUpdates = [];
+  let vendorBalanceApplied = false;
+  let updatedVendor;
+  try {
+    for (const adj of adjustedBills) {
+      const updated = await PurchaseEntry.findOneAndUpdate(
+        { _id: adj.purchaseEntry, balance: { $gte: adj.amount } },
+        { $inc: { paidAmount: adj.amount, balance: -adj.amount } }
+      );
+      if (!updated) {
+        throw new ApiError(
+          400,
+          "One of the adjusted bills no longer has enough outstanding balance for this payment — it may have just been settled by another payment. Please refresh and try again."
+        );
+      }
+      appliedPurchaseUpdates.push({ purchaseEntry: adj.purchaseEntry, amount: Number(adj.amount) });
+    }
+
+    updatedVendor = await Vendor.findByIdAndUpdate(
+      vendorDoc._id,
+      { $inc: { currentBalance: -Number(amount) } },
+      { new: true }
+    );
+    vendorBalanceApplied = true;
+
+    await VendorLedgerEntry.create({
+      vendor: updatedVendor._id,
+      date: payment.date,
+      particulars: `Payment Made${referenceNo ? ` — Ref ${referenceNo}` : ""}`,
+      debit: amount,
+      balanceAfter: updatedVendor.currentBalance,
+      refModel: "VendorPayment",
+      refId: payment._id,
     });
+  } catch (err) {
+    // Reverse whatever already committed, then delete the payment record
+    // itself — VendorPayment's own id isn't referenced by anything created
+    // before it exists, so unlike a StockAdjustment there's nothing else to
+    // leave dangling by removing it outright.
+    for (const applied of appliedPurchaseUpdates.reverse()) {
+      await PurchaseEntry.findByIdAndUpdate(applied.purchaseEntry, {
+        $inc: { paidAmount: -applied.amount, balance: applied.amount },
+      });
+    }
+    if (vendorBalanceApplied) {
+      await Vendor.findByIdAndUpdate(vendorDoc._id, { $inc: { currentBalance: Number(amount) } });
+    }
+    await VendorPayment.findByIdAndDelete(payment._id);
+    throw err;
   }
-
-  const updatedVendor = await Vendor.findByIdAndUpdate(
-    vendorDoc._id,
-    { $inc: { currentBalance: -Number(amount) } },
-    { new: true }
-  );
-
-  await VendorLedgerEntry.create({
-    vendor: updatedVendor._id,
-    date: payment.date,
-    particulars: `Payment Made${referenceNo ? ` — Ref ${referenceNo}` : ""}`,
-    debit: amount,
-    balanceAfter: updatedVendor.currentBalance,
-    refModel: "VendorPayment",
-    refId: payment._id,
-  });
 
   res.status(201).json(new ApiResponse(201, payment, "Payment entry saved successfully"));
 });

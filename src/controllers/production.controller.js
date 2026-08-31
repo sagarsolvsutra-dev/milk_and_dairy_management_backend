@@ -201,23 +201,54 @@ exports.updateProduction = asyncHandler(async (req, res) => {
       createdBy: req.user._id,
     });
   }
-  for (const { itemId, delta } of itemDeltas) {
-    await moveCentralItemStock({
-      item: itemId,
-      quantity: delta,
-      transactionType: "adjustment",
-      refModel: "ProductionEntry",
-      refId: production._id,
-      remark: `Production edited (Batch ${production.batchNo})`,
-      createdBy: req.user._id,
-    });
-  }
 
-  production.date = date || production.date;
-  production.items = resolvedItems;
-  production.totalMilkConsumed = newTotalMilkConsumed;
-  production.remark = remark ?? production.remark;
-  await production.save({ validateModifiedOnly: true });
+  const appliedItemDeltas = [];
+  try {
+    for (const { itemId, delta } of itemDeltas) {
+      await moveCentralItemStock({
+        item: itemId,
+        quantity: delta,
+        transactionType: "adjustment",
+        refModel: "ProductionEntry",
+        refId: production._id,
+        remark: `Production edited (Batch ${production.batchNo})`,
+        createdBy: req.user._id,
+      });
+      appliedItemDeltas.push({ itemId, delta });
+    }
+
+    production.date = date || production.date;
+    production.items = resolvedItems;
+    production.totalMilkConsumed = newTotalMilkConsumed;
+    production.remark = remark ?? production.remark;
+    await production.save({ validateModifiedOnly: true });
+  } catch (err) {
+    // Stock already moved above — reverse everything that committed rather
+    // than leave StockLedger/stock reflecting a change for an edit that
+    // never actually saved (mirrors updatePurchase's own rollback pattern).
+    for (const { itemId, delta } of appliedItemDeltas.reverse()) {
+      await moveCentralItemStock({
+        item: itemId,
+        quantity: -delta,
+        transactionType: "adjustment",
+        refModel: "ProductionEntry",
+        refId: production._id,
+        remark: `Reversal — edit to Batch ${production.batchNo} failed after stock was adjusted`,
+        createdBy: req.user._id,
+      });
+    }
+    if (milkDelta !== 0) {
+      await moveMilkStock({
+        quantity: milkDelta,
+        transactionType: "adjustment",
+        refModel: "ProductionEntry",
+        refId: production._id,
+        remark: `Reversal — edit to Batch ${production.batchNo} failed after stock was adjusted`,
+        createdBy: req.user._id,
+      });
+    }
+    throw err;
+  }
 
   res.status(200).json(new ApiResponse(200, production, "Production entry updated"));
 });
@@ -254,25 +285,58 @@ exports.cancelProduction = asyncHandler(async (req, res) => {
       }
     }
 
-    await moveMilkStock({
-      quantity: production.totalMilkConsumed,
-      transactionType: "adjustment",
-      refModel: "ProductionEntry",
-      refId: production._id,
-      remark: `Reversal — Production cancelled (Batch ${production.batchNo})`,
-      createdBy: req.user._id,
-    });
-
-    for (const row of production.items) {
-      await moveCentralItemStock({
-        item: row.item,
-        quantity: -row.quantity,
+    // The pre-check above isn't authoritative under concurrency — track which
+    // reversals actually succeed so a failure partway through can undo them,
+    // instead of leaving some items reversed while the entry's status flips
+    // back to "active" below as if nothing had happened at all.
+    const reversedItems = [];
+    let milkReversed = false;
+    try {
+      await moveMilkStock({
+        quantity: production.totalMilkConsumed,
         transactionType: "adjustment",
         refModel: "ProductionEntry",
         refId: production._id,
         remark: `Reversal — Production cancelled (Batch ${production.batchNo})`,
         createdBy: req.user._id,
       });
+      milkReversed = true;
+
+      for (const row of production.items) {
+        await moveCentralItemStock({
+          item: row.item,
+          quantity: -row.quantity,
+          transactionType: "adjustment",
+          refModel: "ProductionEntry",
+          refId: production._id,
+          remark: `Reversal — Production cancelled (Batch ${production.batchNo})`,
+          createdBy: req.user._id,
+        });
+        reversedItems.push(row);
+      }
+    } catch (moveErr) {
+      for (const row of reversedItems.reverse()) {
+        await moveCentralItemStock({
+          item: row.item,
+          quantity: row.quantity,
+          transactionType: "adjustment",
+          refModel: "ProductionEntry",
+          refId: production._id,
+          remark: `Undo partial cancel — Batch ${production.batchNo}`,
+          createdBy: req.user._id,
+        });
+      }
+      if (milkReversed) {
+        await moveMilkStock({
+          quantity: -production.totalMilkConsumed,
+          transactionType: "adjustment",
+          refModel: "ProductionEntry",
+          refId: production._id,
+          remark: `Undo partial cancel — Batch ${production.batchNo}`,
+          createdBy: req.user._id,
+        });
+      }
+      throw moveErr;
     }
   } catch (err) {
     await ProductionEntry.findByIdAndUpdate(production._id, { status: "active" });

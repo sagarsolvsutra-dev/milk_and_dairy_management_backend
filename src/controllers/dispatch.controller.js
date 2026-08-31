@@ -184,163 +184,204 @@ exports.updateDispatch = asyncHandler(async (req, res) => {
     if (!(row.quantity >= 0.01)) throw new ApiError(400, "Each item's quantity must be greater than 0");
   }
 
-  if (dairyChanged) {
-    // Relocating to a different dairy — every item is fully leaving the old
-    // dairy and fully arriving at the new one, so the full original quantity
-    // must still be present at the old dairy (nothing sold/used since dispatch).
-    for (const row of dispatch.items) {
-      const stock = await DairyItemStock.findOne({ dairy: dispatch.dairy, item: row.item });
-      const available = stock?.currentQty || 0;
-      if (available < row.quantity) {
-        const itemDoc = await Item.findById(row.item);
-        throw new ApiError(
-          400,
-          `Cannot move dispatch — only ${available} units of ${itemDoc?.name || "this item"} remain at the original dairy (the rest has already been sold/used)`
-        );
-      }
-    }
-    const projectedCentral = new Map();
-    for (const row of dispatch.items) {
-      const key = String(row.item);
-      // Sum, not overwrite — the original dispatch can list the same item on
-      // more than one row, and each row's quantity is separately headed back
-      // to central stock once the reversal below runs.
-      if (!projectedCentral.has(key)) {
-        const stock = await CentralItemStock.findOne({ item: row.item });
-        projectedCentral.set(key, stock?.currentQty || 0);
-      }
-      projectedCentral.set(key, projectedCentral.get(key) + Number(row.quantity));
-    }
-    for (const row of resolvedItems) {
-      let base = projectedCentral.get(row.item);
-      if (base === undefined) {
-        const stock = await CentralItemStock.findOne({ item: row.item });
-        base = stock?.currentQty || 0;
-      }
-      if (base < row.quantity) {
-        const itemDoc = await Item.findById(row.item);
-        throw new ApiError(400, `Insufficient central stock for ${itemDoc?.name || "item"} to save this edit — available: ${base}, requested: ${row.quantity}`);
-      }
-      projectedCentral.set(row.item, base - row.quantity);
-    }
+  // Every stock move below is tracked so it can be reversed if a later step
+  // in this same edit fails — mirrors updatePurchase's own rollback pattern,
+  // extended to a list since a dispatch edit can move several item rows.
+  const appliedOps = [];
+  const reverseOp = (op) =>
+    op.mover === "central"
+      ? moveCentralItemStock({
+          item: op.item,
+          quantity: -op.quantity,
+          transactionType: "adjustment",
+          refModel: "DispatchEntry",
+          refId: dispatch._id,
+          remark: `Reversal — edit to ${dispatch.dispatchNo} failed after stock was adjusted`,
+          createdBy: req.user._id,
+        })
+      : moveDairyItemStock({
+          dairy: op.dairy,
+          item: op.item,
+          quantity: -op.quantity,
+          transactionType: "adjustment",
+          refModel: "DispatchEntry",
+          refId: dispatch._id,
+          remark: `Reversal — edit to ${dispatch.dispatchNo} failed after stock was adjusted`,
+          createdBy: req.user._id,
+        });
 
-    for (const row of dispatch.items) {
-      await moveDairyItemStock({
-        dairy: dispatch.dairy,
-        item: row.item,
-        quantity: -row.quantity,
-        transactionType: "adjustment",
-        refModel: "DispatchEntry",
-        refId: dispatch._id,
-        remark: `Reversal — Dispatch edited (${dispatch.dispatchNo})`,
-        createdBy: req.user._id,
-      });
-      await moveCentralItemStock({
-        item: row.item,
-        quantity: row.quantity,
-        transactionType: "adjustment",
-        refModel: "DispatchEntry",
-        refId: dispatch._id,
-        remark: `Reversal — Dispatch edited (${dispatch.dispatchNo})`,
-        createdBy: req.user._id,
-      });
-    }
-    for (const row of resolvedItems) {
-      await moveCentralItemStock({
-        item: row.item,
-        quantity: -row.quantity,
-        transactionType: "adjustment",
-        refModel: "DispatchEntry",
-        refId: dispatch._id,
-        remark: `Dispatch edited (${dispatch.dispatchNo})`,
-        createdBy: req.user._id,
-      });
-      await moveDairyItemStock({
-        dairy: newDairyId,
-        item: row.item,
-        quantity: row.quantity,
-        transactionType: "adjustment",
-        refModel: "DispatchEntry",
-        refId: dispatch._id,
-        remark: `Dispatch edited (${dispatch.dispatchNo})`,
-        createdBy: req.user._id,
-      });
-    }
-  } else {
-    // Same dairy — only move stock for the DIFFERENCE per item. Touching
-    // unchanged items would needlessly demand their full original quantity
-    // still be sitting at the dairy, blocking even a remark-only edit once
-    // any item has been sold/used.
-    // Sum (not overwrite) quantities per item id — an entry can legitimately
-    // list the same item on more than one row, and a plain `new Map(...)`
-    // would keep only the last row's quantity, silently dropping the earlier
-    // rows from the delta math while they'd still be saved on the document.
-    const sumQtyByItem = (rows) => {
-      const map = new Map();
-      for (const row of rows) {
-        const key = String(row.item);
-        map.set(key, (map.get(key) || 0) + Number(row.quantity));
-      }
-      return map;
-    };
-    const oldQtyByItem = sumQtyByItem(dispatch.items);
-    const newQtyByItem = sumQtyByItem(resolvedItems);
-    const itemIds = new Set([...oldQtyByItem.keys(), ...newQtyByItem.keys()]);
-    const itemDeltas = [...itemIds]
-      .map((itemId) => ({ itemId, delta: (newQtyByItem.get(itemId) || 0) - (oldQtyByItem.get(itemId) || 0) }))
-      .filter((d) => d.delta !== 0);
-
-    for (const { itemId, delta } of itemDeltas) {
-      if (delta < 0) {
-        const stock = await DairyItemStock.findOne({ dairy: dispatch.dairy, item: itemId });
+  try {
+    if (dairyChanged) {
+      // Relocating to a different dairy — every item is fully leaving the old
+      // dairy and fully arriving at the new one, so the full original quantity
+      // must still be present at the old dairy (nothing sold/used since dispatch).
+      for (const row of dispatch.items) {
+        const stock = await DairyItemStock.findOne({ dairy: dispatch.dairy, item: row.item });
         const available = stock?.currentQty || 0;
-        if (available < -delta) {
-          const itemDoc = await Item.findById(itemId);
+        if (available < row.quantity) {
+          const itemDoc = await Item.findById(row.item);
           throw new ApiError(
             400,
-            `Cannot reduce ${itemDoc?.name || "this item"} — only ${available} units remain at the dairy (the rest has already been sold/used)`
+            `Cannot move dispatch — only ${available} units of ${itemDoc?.name || "this item"} remain at the original dairy (the rest has already been sold/used)`
           );
         }
-      } else {
-        const stock = await CentralItemStock.findOne({ item: itemId });
-        const available = stock?.currentQty || 0;
-        if (available < delta) {
-          const itemDoc = await Item.findById(itemId);
-          throw new ApiError(400, `Insufficient central stock for ${itemDoc?.name || "item"} — available: ${available}, additional needed: ${delta}`);
+      }
+      const projectedCentral = new Map();
+      for (const row of dispatch.items) {
+        const key = String(row.item);
+        // Sum, not overwrite — the original dispatch can list the same item on
+        // more than one row, and each row's quantity is separately headed back
+        // to central stock once the reversal below runs.
+        if (!projectedCentral.has(key)) {
+          const stock = await CentralItemStock.findOne({ item: row.item });
+          projectedCentral.set(key, stock?.currentQty || 0);
         }
+        projectedCentral.set(key, projectedCentral.get(key) + Number(row.quantity));
+      }
+      for (const row of resolvedItems) {
+        let base = projectedCentral.get(row.item);
+        if (base === undefined) {
+          const stock = await CentralItemStock.findOne({ item: row.item });
+          base = stock?.currentQty || 0;
+        }
+        if (base < row.quantity) {
+          const itemDoc = await Item.findById(row.item);
+          throw new ApiError(400, `Insufficient central stock for ${itemDoc?.name || "item"} to save this edit — available: ${base}, requested: ${row.quantity}`);
+        }
+        projectedCentral.set(row.item, base - row.quantity);
+      }
+
+      for (const row of dispatch.items) {
+        await moveDairyItemStock({
+          dairy: dispatch.dairy,
+          item: row.item,
+          quantity: -row.quantity,
+          transactionType: "adjustment",
+          refModel: "DispatchEntry",
+          refId: dispatch._id,
+          remark: `Reversal — Dispatch edited (${dispatch.dispatchNo})`,
+          createdBy: req.user._id,
+        });
+        appliedOps.push({ mover: "dairy", dairy: dispatch.dairy, item: row.item, quantity: -row.quantity });
+        await moveCentralItemStock({
+          item: row.item,
+          quantity: row.quantity,
+          transactionType: "adjustment",
+          refModel: "DispatchEntry",
+          refId: dispatch._id,
+          remark: `Reversal — Dispatch edited (${dispatch.dispatchNo})`,
+          createdBy: req.user._id,
+        });
+        appliedOps.push({ mover: "central", item: row.item, quantity: row.quantity });
+      }
+      for (const row of resolvedItems) {
+        await moveCentralItemStock({
+          item: row.item,
+          quantity: -row.quantity,
+          transactionType: "adjustment",
+          refModel: "DispatchEntry",
+          refId: dispatch._id,
+          remark: `Dispatch edited (${dispatch.dispatchNo})`,
+          createdBy: req.user._id,
+        });
+        appliedOps.push({ mover: "central", item: row.item, quantity: -row.quantity });
+        await moveDairyItemStock({
+          dairy: newDairyId,
+          item: row.item,
+          quantity: row.quantity,
+          transactionType: "adjustment",
+          refModel: "DispatchEntry",
+          refId: dispatch._id,
+          remark: `Dispatch edited (${dispatch.dispatchNo})`,
+          createdBy: req.user._id,
+        });
+        appliedOps.push({ mover: "dairy", dairy: newDairyId, item: row.item, quantity: row.quantity });
+      }
+    } else {
+      // Same dairy — only move stock for the DIFFERENCE per item. Touching
+      // unchanged items would needlessly demand their full original quantity
+      // still be sitting at the dairy, blocking even a remark-only edit once
+      // any item has been sold/used.
+      // Sum (not overwrite) quantities per item id — an entry can legitimately
+      // list the same item on more than one row, and a plain `new Map(...)`
+      // would keep only the last row's quantity, silently dropping the earlier
+      // rows from the delta math while they'd still be saved on the document.
+      const sumQtyByItem = (rows) => {
+        const map = new Map();
+        for (const row of rows) {
+          const key = String(row.item);
+          map.set(key, (map.get(key) || 0) + Number(row.quantity));
+        }
+        return map;
+      };
+      const oldQtyByItem = sumQtyByItem(dispatch.items);
+      const newQtyByItem = sumQtyByItem(resolvedItems);
+      const itemIds = new Set([...oldQtyByItem.keys(), ...newQtyByItem.keys()]);
+      const itemDeltas = [...itemIds]
+        .map((itemId) => ({ itemId, delta: (newQtyByItem.get(itemId) || 0) - (oldQtyByItem.get(itemId) || 0) }))
+        .filter((d) => d.delta !== 0);
+
+      for (const { itemId, delta } of itemDeltas) {
+        if (delta < 0) {
+          const stock = await DairyItemStock.findOne({ dairy: dispatch.dairy, item: itemId });
+          const available = stock?.currentQty || 0;
+          if (available < -delta) {
+            const itemDoc = await Item.findById(itemId);
+            throw new ApiError(
+              400,
+              `Cannot reduce ${itemDoc?.name || "this item"} — only ${available} units remain at the dairy (the rest has already been sold/used)`
+            );
+          }
+        } else {
+          const stock = await CentralItemStock.findOne({ item: itemId });
+          const available = stock?.currentQty || 0;
+          if (available < delta) {
+            const itemDoc = await Item.findById(itemId);
+            throw new ApiError(400, `Insufficient central stock for ${itemDoc?.name || "item"} — available: ${available}, additional needed: ${delta}`);
+          }
+        }
+      }
+
+      for (const { itemId, delta } of itemDeltas) {
+        await moveCentralItemStock({
+          item: itemId,
+          quantity: -delta,
+          transactionType: "adjustment",
+          refModel: "DispatchEntry",
+          refId: dispatch._id,
+          remark: `Dispatch edited (${dispatch.dispatchNo})`,
+          createdBy: req.user._id,
+        });
+        appliedOps.push({ mover: "central", item: itemId, quantity: -delta });
+        await moveDairyItemStock({
+          dairy: dispatch.dairy,
+          item: itemId,
+          quantity: delta,
+          transactionType: "adjustment",
+          refModel: "DispatchEntry",
+          refId: dispatch._id,
+          remark: `Dispatch edited (${dispatch.dispatchNo})`,
+          createdBy: req.user._id,
+        });
+        appliedOps.push({ mover: "dairy", dairy: dispatch.dairy, item: itemId, quantity: delta });
       }
     }
 
-    for (const { itemId, delta } of itemDeltas) {
-      await moveCentralItemStock({
-        item: itemId,
-        quantity: -delta,
-        transactionType: "adjustment",
-        refModel: "DispatchEntry",
-        refId: dispatch._id,
-        remark: `Dispatch edited (${dispatch.dispatchNo})`,
-        createdBy: req.user._id,
-      });
-      await moveDairyItemStock({
-        dairy: dispatch.dairy,
-        item: itemId,
-        quantity: delta,
-        transactionType: "adjustment",
-        refModel: "DispatchEntry",
-        refId: dispatch._id,
-        remark: `Dispatch edited (${dispatch.dispatchNo})`,
-        createdBy: req.user._id,
-      });
+    dispatch.date = date || dispatch.date;
+    dispatch.dairy = newDairyId;
+    dispatch.items = items.map((row) => ({ item: row.item, quantity: Number(row.quantity) }));
+    dispatch.vehicleNo = vehicleNo ?? dispatch.vehicleNo;
+    dispatch.driverName = driverName ?? dispatch.driverName;
+    dispatch.remark = remark ?? dispatch.remark;
+    await dispatch.save({ validateModifiedOnly: true });
+  } catch (err) {
+    // Stock already moved above — reverse everything that committed rather
+    // than leave stock reflecting a change for an edit that never actually saved.
+    for (const op of appliedOps.reverse()) {
+      await reverseOp(op);
     }
+    throw err;
   }
-
-  dispatch.date = date || dispatch.date;
-  dispatch.dairy = newDairyId;
-  dispatch.items = items.map((row) => ({ item: row.item, quantity: Number(row.quantity) }));
-  dispatch.vehicleNo = vehicleNo ?? dispatch.vehicleNo;
-  dispatch.driverName = driverName ?? dispatch.driverName;
-  dispatch.remark = remark ?? dispatch.remark;
-  await dispatch.save({ validateModifiedOnly: true });
 
   res.status(200).json(new ApiResponse(200, dispatch, "Dispatch entry updated"));
 });
@@ -377,26 +418,62 @@ exports.cancelDispatch = asyncHandler(async (req, res) => {
       }
     }
 
-    for (const row of dispatch.items) {
-      await moveDairyItemStock({
-        dairy: dispatch.dairy,
-        item: row.item,
-        quantity: -row.quantity,
-        transactionType: "adjustment",
-        refModel: "DispatchEntry",
-        refId: dispatch._id,
-        remark: `Reversal — Dispatch cancelled (${dispatch.dispatchNo})`,
-        createdBy: req.user._id,
-      });
-      await moveCentralItemStock({
-        item: row.item,
-        quantity: row.quantity,
-        transactionType: "adjustment",
-        refModel: "DispatchEntry",
-        refId: dispatch._id,
-        remark: `Reversal — Dispatch cancelled (${dispatch.dispatchNo})`,
-        createdBy: req.user._id,
-      });
+    // The pre-check above isn't authoritative under concurrency — track each
+    // individual mover call that actually succeeds so a failure partway
+    // through (even mid-row, between a row's two moves) can undo exactly
+    // what committed, instead of leaving the entry half-reversed while its
+    // status flips back to "active" below as if nothing had happened.
+    const appliedOps = [];
+    try {
+      for (const row of dispatch.items) {
+        await moveDairyItemStock({
+          dairy: dispatch.dairy,
+          item: row.item,
+          quantity: -row.quantity,
+          transactionType: "adjustment",
+          refModel: "DispatchEntry",
+          refId: dispatch._id,
+          remark: `Reversal — Dispatch cancelled (${dispatch.dispatchNo})`,
+          createdBy: req.user._id,
+        });
+        appliedOps.push({ mover: "dairy", item: row.item, quantity: -row.quantity });
+        await moveCentralItemStock({
+          item: row.item,
+          quantity: row.quantity,
+          transactionType: "adjustment",
+          refModel: "DispatchEntry",
+          refId: dispatch._id,
+          remark: `Reversal — Dispatch cancelled (${dispatch.dispatchNo})`,
+          createdBy: req.user._id,
+        });
+        appliedOps.push({ mover: "central", item: row.item, quantity: row.quantity });
+      }
+    } catch (moveErr) {
+      for (const op of appliedOps.reverse()) {
+        if (op.mover === "central") {
+          await moveCentralItemStock({
+            item: op.item,
+            quantity: -op.quantity,
+            transactionType: "adjustment",
+            refModel: "DispatchEntry",
+            refId: dispatch._id,
+            remark: `Undo partial cancel — ${dispatch.dispatchNo}`,
+            createdBy: req.user._id,
+          });
+        } else {
+          await moveDairyItemStock({
+            dairy: dispatch.dairy,
+            item: op.item,
+            quantity: -op.quantity,
+            transactionType: "adjustment",
+            refModel: "DispatchEntry",
+            refId: dispatch._id,
+            remark: `Undo partial cancel — ${dispatch.dispatchNo}`,
+            createdBy: req.user._id,
+          });
+        }
+      }
+      throw moveErr;
     }
   } catch (err) {
     await DispatchEntry.findByIdAndUpdate(dispatch._id, { status: "active" });
