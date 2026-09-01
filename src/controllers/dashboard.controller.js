@@ -11,20 +11,13 @@ const ApiResponse = require("../utils/ApiResponse");
 
 const startOfToday = () => {
   const d = new Date();
-  d.setHours(0, 0, 0, 0);
+  d.setUTCHours(0, 0, 0, 0);
   return d;
 };
 
-// Low stock preview lists on a dashboard are a summary, not the full picture —
-// cap what's shown but always sort so the cap keeps the most urgent items,
-// never an arbitrary slice by insertion order.
 const DASHBOARD_ALERT_PREVIEW_LIMIT = 8;
 
-// A proper (a, b) comparator, not a single-argument key extractor — Array.sort
-// calls its callback with two elements and expects their relative order back;
-// a function that only reads its first argument returns the same value
-// regardless of what it's compared against and doesn't actually sort past
-// the first element.
+
 const deficit = (s) => s.currentQty - s.item.minStockAlert;
 const bySeverity = (a, b) => deficit(a) - deficit(b);
 
@@ -51,7 +44,8 @@ exports.getSuperAdminDashboard = asyncHandler(async (req, res) => {
       { $unwind: "$items" },
       { $group: { _id: "$items.item", quantity: { $sum: "$items.quantity" } } },
     ]),
-    Vendor.countDocuments({ currentBalance: { $gt: 0 } }),
+
+    Vendor.countDocuments({ currentBalance: { $gt: 0.005 } }),
     Dairy.countDocuments({ status: "active" }),
     Dairy.countDocuments(),
     CentralItemStock.find().populate("item", "name code minStockAlert").lean(),
@@ -120,6 +114,7 @@ exports.getDairyDashboard = asyncHandler(async (req, res) => {
 exports.getAnalytics = asyncHandler(async (req, res) => {
   const days = 30;
   const from = new Date();
+  from.setUTCHours(0, 0, 0, 0);
   from.setDate(from.getDate() - days);
 
   const [purchaseTrend, productionByItem, dairySales, topItems] = await Promise.all([

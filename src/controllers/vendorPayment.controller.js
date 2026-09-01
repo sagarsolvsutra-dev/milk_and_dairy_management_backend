@@ -150,8 +150,7 @@ exports.getOutstandingReport = asyncHandler(async (req, res) => {
   const { page = 1, limit = 10 } = req.query;
   const pageNum = Math.max(1, parseInt(page));
   const limitNum = Math.max(1, parseInt(limit));
-
-  const filter = { currentBalance: { $ne: 0 } };
+  const filter = { $or: [{ currentBalance: { $gt: 0.005 } }, { currentBalance: { $lt: -0.005 } }] };
   const [vendors, total] = await Promise.all([
     Vendor.find(filter)
       .sort({ currentBalance: -1 })
