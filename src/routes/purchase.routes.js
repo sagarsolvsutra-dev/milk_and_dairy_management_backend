@@ -10,5 +10,6 @@ router.post("/", ...canDo("purchase", "add"), ctrl.createPurchase);
 router.get("/:id", ...canDo("purchase", "view"), ctrl.getPurchase);
 router.put("/:id", ...canDo("purchase", "edit"), ctrl.updatePurchase);
 router.patch("/:id/cancel", ...canDo("purchase", "delete"), ctrl.cancelPurchase);
+router.delete("/:id", ...canDo("purchase", "delete"), ctrl.deletePurchase);
 
 module.exports = router;

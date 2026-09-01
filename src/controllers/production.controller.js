@@ -2,6 +2,7 @@ const ProductionEntry = require("../models/ProductionEntry.model");
 const Item = require("../models/Item.model");
 const MilkStock = require("../models/MilkStock.model");
 const CentralItemStock = require("../models/CentralItemStock.model");
+const StockLedger = require("../models/StockLedger.model");
 const asyncHandler = require("../utils/asyncHandler");
 const ApiResponse = require("../utils/ApiResponse");
 const ApiError = require("../utils/ApiError");
@@ -345,4 +346,95 @@ exports.cancelProduction = asyncHandler(async (req, res) => {
 
   const updated = await ProductionEntry.findById(production._id);
   res.status(200).json(new ApiResponse(200, updated, "Production entry cancelled"));
+});
+
+// Unlike cancel (a status flip that keeps the record as a permanent audit
+// trail), this permanently removes the batch — for an ACTIVE entry it
+// reverses its stock effect first, exactly like cancelProduction, so a
+// deleted batch never leaves stock out of sync; it then hard-deletes the
+// record and the StockLedger rows that only ever existed to describe it.
+exports.deleteProduction = asyncHandler(async (req, res) => {
+  const existing = await ProductionEntry.findById(req.params.id);
+  if (!existing) throw new ApiError(404, "Production entry not found");
+
+  if (existing.status === "active") {
+    const production = await ProductionEntry.findOneAndUpdate(
+      { _id: existing._id, status: "active" },
+      { status: "cancelled" },
+      { new: false }
+    );
+    if (!production) throw new ApiError(400, "Production entry was just modified by another request — please retry");
+
+    try {
+      for (const row of production.items) {
+        const stock = await CentralItemStock.findOne({ item: row.item });
+        const available = stock?.currentQty || 0;
+        if (available < row.quantity) {
+          const item = await Item.findById(row.item);
+          throw new ApiError(
+            400,
+            `Cannot delete — only ${available} units of ${item?.name || "this item"} remain in central stock, but this batch produced ${row.quantity} (the rest has already been dispatched)`
+          );
+        }
+      }
+
+      const reversedItems = [];
+      let milkReversed = false;
+      try {
+        await moveMilkStock({
+          quantity: production.totalMilkConsumed,
+          transactionType: "adjustment",
+          refModel: "ProductionEntry",
+          refId: production._id,
+          remark: `Reversal — Production deleted (Batch ${production.batchNo})`,
+          createdBy: req.user._id,
+        });
+        milkReversed = true;
+
+        for (const row of production.items) {
+          await moveCentralItemStock({
+            item: row.item,
+            quantity: -row.quantity,
+            transactionType: "adjustment",
+            refModel: "ProductionEntry",
+            refId: production._id,
+            remark: `Reversal — Production deleted (Batch ${production.batchNo})`,
+            createdBy: req.user._id,
+          });
+          reversedItems.push(row);
+        }
+      } catch (moveErr) {
+        for (const row of reversedItems.reverse()) {
+          await moveCentralItemStock({
+            item: row.item,
+            quantity: row.quantity,
+            transactionType: "adjustment",
+            refModel: "ProductionEntry",
+            refId: production._id,
+            remark: `Undo partial delete — Batch ${production.batchNo}`,
+            createdBy: req.user._id,
+          });
+        }
+        if (milkReversed) {
+          await moveMilkStock({
+            quantity: -production.totalMilkConsumed,
+            transactionType: "adjustment",
+            refModel: "ProductionEntry",
+            refId: production._id,
+            remark: `Undo partial delete — Batch ${production.batchNo}`,
+            createdBy: req.user._id,
+          });
+        }
+        throw moveErr;
+      }
+    } catch (err) {
+      await ProductionEntry.findByIdAndUpdate(production._id, { status: "active" });
+      throw err;
+    }
+  }
+
+  await StockLedger.deleteMany({ refModel: "ProductionEntry", refId: existing._id });
+  await ProductionEntry.findByIdAndDelete(existing._id);
+
+  res.status(200).json(new ApiResponse(200, null, "Production entry deleted"));
 });

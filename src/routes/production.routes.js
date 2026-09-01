@@ -10,5 +10,6 @@ router.post("/", ...canDo("production", "add"), ctrl.createProduction);
 router.get("/:id", ...canDo("production", "view"), ctrl.getProduction);
 router.put("/:id", ...canDo("production", "edit"), ctrl.updateProduction);
 router.patch("/:id/cancel", ...canDo("production", "delete"), ctrl.cancelProduction);
+router.delete("/:id", ...canDo("production", "delete"), ctrl.deleteProduction);
 
 module.exports = router;

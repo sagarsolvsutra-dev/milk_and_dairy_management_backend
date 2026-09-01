@@ -3,6 +3,8 @@ const { dateRangeFilter } = require("../utils/dateRangeFilter");
 const PurchaseEntry = require("../models/PurchaseEntry.model");
 const Vendor = require("../models/Vendor.model");
 const VendorLedgerEntry = require("../models/VendorLedgerEntry.model");
+const VendorPayment = require("../models/VendorPayment.model");
+const StockLedger = require("../models/StockLedger.model");
 const MilkStock = require("../models/MilkStock.model");
 const asyncHandler = require("../utils/asyncHandler");
 const ApiResponse = require("../utils/ApiResponse");
@@ -351,4 +353,76 @@ exports.cancelPurchase = asyncHandler(async (req, res) => {
 
   const updated = await PurchaseEntry.findById(purchase._id);
   res.status(200).json(new ApiResponse(200, updated, "Purchase entry cancelled"));
+});
+
+// Unlike cancel (a status flip that keeps the record as a permanent audit
+// trail), this permanently removes the purchase — for an ACTIVE entry it
+// reverses its stock/vendor effect first, exactly like cancelPurchase, so a
+// deleted purchase never leaves stock or the vendor ledger out of sync; it
+// then hard-deletes the record and the StockLedger/VendorLedgerEntry rows
+// that only ever existed to describe it.
+exports.deletePurchase = asyncHandler(async (req, res) => {
+  const existing = await PurchaseEntry.findById(req.params.id);
+  if (!existing) throw new ApiError(404, "Purchase entry not found");
+
+  // A purchase with a payment already allocated against it via "Add Payment"
+  // (vendorPayment.controller.js's adjustedBills) can't be safely deleted —
+  // untangling which historical VendorPayment record paid down how much of
+  // a now-gone purchase isn't something that can be reconstructed. Same
+  // checkDependents-style guard used for Vendor/Dairy/Item/Unit deletes.
+  const hasPayment = await VendorPayment.exists({ "adjustedBills.purchaseEntry": existing._id });
+  if (hasPayment) {
+    throw new ApiError(
+      400,
+      "This purchase has a payment recorded against it and can't be deleted — cancel it instead, or remove the associated payment first."
+    );
+  }
+
+  if (existing.status === "active") {
+    // Atomically claim it the same way cancelPurchase does — a concurrent
+    // duplicate delete/cancel request gets null back here and stops before
+    // touching stock or the ledger, instead of both racing past this check.
+    const purchase = await PurchaseEntry.findOneAndUpdate(
+      { _id: existing._id, status: "active" },
+      { status: "cancelled" },
+      { new: false }
+    );
+    if (!purchase) throw new ApiError(400, "Purchase entry was just modified by another request — please retry");
+
+    try {
+      const milkStock = await MilkStock.findOne({ key: "central" });
+      const availableMilk = milkStock?.currentQty || 0;
+      if (availableMilk < purchase.quantity) {
+        throw new ApiError(
+          400,
+          `Cannot delete — only ${availableMilk} KG of milk remains in stock, but this purchase added ${purchase.quantity} KG (the rest has already been used in production)`
+        );
+      }
+
+      await moveMilkStock({
+        quantity: -purchase.quantity,
+        transactionType: "adjustment",
+        refModel: "PurchaseEntry",
+        refId: purchase._id,
+        remark: `Reversal — Purchase deleted (Bill ${purchase.billNo})`,
+        createdBy: req.user._id,
+      });
+
+      await Vendor.findByIdAndUpdate(purchase.vendor, {
+        $inc: { currentBalance: -(purchase.netPayable - purchase.paidAmount) },
+      });
+    } catch (err) {
+      await PurchaseEntry.findByIdAndUpdate(purchase._id, { status: "active" });
+      throw err;
+    }
+  }
+
+  // Everything that only ever existed to describe this purchase — its own
+  // create/reversal stock and ledger entries — is safe to remove along with
+  // it; nothing else references them.
+  await StockLedger.deleteMany({ refModel: "PurchaseEntry", refId: existing._id });
+  await VendorLedgerEntry.deleteMany({ refModel: "PurchaseEntry", refId: existing._id });
+  await PurchaseEntry.findByIdAndDelete(existing._id);
+
+  res.status(200).json(new ApiResponse(200, null, "Purchase entry deleted"));
 });
